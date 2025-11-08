@@ -31,7 +31,7 @@ def test_neural_comapping(num_episodes=10):
     print("\n創建使用NeuralCoMapping的機器人...")
     robot1, robot2 = create_neural_comapping_robots(
         index_map=0,
-        use_neural=False  # 先用簡化版測試
+        use_neural=True  # 先用簡化版測試
     )
     
     results = {
