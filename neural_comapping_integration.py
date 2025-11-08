@@ -1,6 +1,9 @@
 """
 Multi-Robot Environment with NeuralCoMapping Integration
 將NeuralCoMapping的global planner替換原本的DQN frontier selection
+[新增] 優先選擇 sensor_range * 2 以內的 frontier
+[新增] 確保兩台機器人選點不會太近
+[修復] 索引錯誤
 """
 
 import numpy as np
@@ -19,14 +22,115 @@ class RobotWithNeuralCoMapping:
         
         # [新增] 全局規劃的頻率
         self.replanning_frequency = 10  # 每 10 步重新指派一次
+        
+        # [新增] 最小目標間距離（避免兩機器人選點太近）
+        self.min_target_separation = self.robot.sensor_range * 1.5  # 預設 75
     
     def set_other_robot(self, other_wrapper):
         """設定另一個機器人的wrapper"""
         self.other_robot_wrapper = other_wrapper
     
+    def filter_frontiers_by_range(self, frontiers, max_range=None):
+        """
+        [新增] 過濾出範圍內的 frontiers
+        
+        Args:
+            frontiers: numpy array (N, 2) - 所有 frontier 點
+            max_range: 最大距離（預設為 sensor_range * 2）
+            
+        Returns:
+            in_range_frontiers: 範圍內的 frontiers
+            out_range_frontiers: 範圍外的 frontiers
+        """
+        if max_range is None:
+            max_range = self.robot.sensor_range * 2
+        
+        # 計算每個 frontier 到機器人的距離
+        distances = np.linalg.norm(frontiers - self.robot.robot_position, axis=1)
+        
+        # 分類為範圍內和範圍外
+        in_range_mask = distances <= max_range
+        in_range_frontiers = frontiers[in_range_mask]
+        out_range_frontiers = frontiers[~in_range_mask]
+        
+        return in_range_frontiers, out_range_frontiers
+    
+    def adjust_assignments_for_separation(self, assignments, frontiers_array, robots):
+        """
+        [新增] 調整分配結果，確保兩個機器人的目標點不會太近
+        [修復] 正確處理 assignments 中已經是座標而非索引的情況
+        
+        Args:
+            assignments: {robot_idx: (x, y)} - NCM 的原始分配（已經是座標）
+            frontiers_array: numpy array (N, 2) - 所有 frontier 座標
+            robots: list of tuples - 兩個機器人的位置
+            
+        Returns:
+            adjusted_assignments: 調整後的分配
+        """
+        # 如果只有一個機器人被分配，或沒有分配，直接返回
+        if len(assignments) < 2:
+            return assignments
+        
+        # 獲取兩個機器人的分配（注意：assignments 的值已經是座標 tuple，不是索引）
+        if 0 not in assignments or 1 not in assignments:
+            return assignments
+        
+        target_0 = np.array(assignments[0])
+        target_1 = np.array(assignments[1])
+        
+        # 計算兩個目標點之間的距離
+        target_distance = np.linalg.norm(target_0 - target_1)
+        
+        robot_name = "Robot1" if self.robot.is_primary else "Robot2"
+        
+        # 如果距離太近，需要調整
+        if target_distance < self.min_target_separation:
+            print(f"[NCM SEPARATION] {robot_name}: 目標距離 {target_distance:.1f} < {self.min_target_separation:.1f}，需要調整")
+            
+            # 找出應該被調整的機器人（優先調整離自己遠的那個）
+            dist_0_to_target_0 = np.linalg.norm(np.array(robots[0]) - target_0)
+            dist_1_to_target_1 = np.linalg.norm(np.array(robots[1]) - target_1)
+            
+            # 決定調整哪個機器人的目標
+            # 調整離目標較遠的機器人（因為對它影響較小）
+            robot_to_adjust = 0 if dist_0_to_target_0 > dist_1_to_target_1 else 1
+            other_robot = 1 - robot_to_adjust
+            other_target = target_0 if other_robot == 0 else target_1
+            
+            # 尋找替代目標（距離當前機器人近，但距離另一機器人目標遠）
+            robot_pos = np.array(robots[robot_to_adjust])
+            
+            # 計算所有 frontier 到當前機器人的距離
+            dists_to_robot = np.linalg.norm(frontiers_array - robot_pos, axis=1)
+            # 計算所有 frontier 到另一機器人目標的距離
+            dists_to_other_target = np.linalg.norm(frontiers_array - other_target, axis=1)
+            
+            # 過濾掉距離另一機器人目標太近的點
+            valid_mask = dists_to_other_target >= self.min_target_separation
+            
+            if np.any(valid_mask):
+                # 在有效點中選擇距離當前機器人最近的
+                valid_indices = np.where(valid_mask)[0]
+                valid_dists = dists_to_robot[valid_indices]
+                best_idx = valid_indices[np.argmin(valid_dists)]
+                
+                # 更新分配（使用座標）
+                new_target = tuple(frontiers_array[best_idx])
+                assignments[robot_to_adjust] = new_target
+                print(f"[NCM SEPARATION] 調整 Robot{robot_to_adjust+1} 的目標 (新距離: {dists_to_robot[best_idx]:.1f})")
+            else:
+                print(f"[NCM SEPARATION] 警告：找不到符合距離要求的替代目標，保持原分配")
+        else:
+            print(f"[NCM SEPARATION] {robot_name}: 目標距離 {target_distance:.1f} ✓ (≥ {self.min_target_separation:.1f})")
+        
+        return assignments
+    
     def step_with_neural_planner(self):
         """
         [全新修正] 實現真正的 NCM 分層規劃邏輯
+        [新增] 優先選擇 sensor_range * 2 以內的 frontier
+        [新增] 確保兩台機器人選點不會太近
         """
         
         # 檢查是否需要執行「全局規劃」(NCM 分配)
@@ -34,36 +138,75 @@ class RobotWithNeuralCoMapping:
         if (self.robot.steps % self.replanning_frequency == 0) or (self.current_global_goal is None):
             
             # --- 1. 全局規劃器 (NCM) ---
-            frontiers = self.robot.get_frontiers()
+            all_frontiers = self.robot.get_frontiers()
             
-            if len(frontiers) == 0:
+            if len(all_frontiers) == 0:
                 return None, self.robot.check_done()
 
-            # [可選優化] 在這裡插入 DBSCAN 群集邏輯 (參考 siyandong/utils/map_manager.py)
-            # clustered_frontiers = run_dbscan(frontiers)
-            # ... 為了簡單起見，我們先使用原始 frontiers ...
+            # [新增] 優先選擇範圍內的 frontiers
+            max_range = self.robot.sensor_range * 2  # 100
+            in_range_frontiers, out_range_frontiers = self.filter_frontiers_by_range(
+                all_frontiers, max_range
+            )
+            
+            robot_name = "Robot1" if self.robot.is_primary else "Robot2"
+            
+            # 優先使用範圍內的 frontiers
+            if len(in_range_frontiers) > 0:
+                frontiers = in_range_frontiers
+                print(f"[NCM RANGE] {robot_name}: 使用 {len(in_range_frontiers)} 個範圍內的 frontiers (距離 ≤ {max_range})")
+            else:
+                frontiers = all_frontiers
+                print(f"[NCM RANGE] {robot_name}: 範圍內無 frontiers，使用全部 {len(all_frontiers)} 個")
 
             robots = [
                 tuple(self.robot.robot_position),
                 tuple(self.robot.other_robot_position)
             ]
 
+            # NCM 分配（返回的是 {robot_idx: (x, y)} 形式）
             assignments = self.planner.select_frontiers(
                 robots, 
-                frontiers, # 理想情況下應為 clustered_frontiers
+                frontiers,
                 self.robot.op_map
             )
             
-            robot_idx = 0 if self.robot.is_primary else 1
-            robot_name = "Robot1" if self.robot.is_primary else "Robot2" # Debug
+            # [新增] 調整分配，確保兩個機器人的目標不會太近
+            # 注意：assignments 已經是 {robot_idx: (x, y)} 形式，不需要再轉換
+            adjusted_assignments = self.adjust_assignments_for_separation(
+                assignments, 
+                frontiers,  # 直接傳遞 numpy array
+                robots
+            )
             
-            if robot_idx not in assignments:
+            robot_idx = 0 if self.robot.is_primary else 1
+            
+            if robot_idx not in adjusted_assignments:
                 print(f"[NCM DEBUG] {robot_name}: NCM 未分配, 啟動 [後援-最近點]")
+                
+                # 後援策略也要考慮與另一機器人的距離
                 dists = np.linalg.norm(frontiers - self.robot.robot_position, axis=1)
-                new_target = frontiers[np.argmin(dists)]
+                
+                # 如果另一個機器人有目標，避開它
+                if self.other_robot_wrapper and self.other_robot_wrapper.current_global_goal is not None:
+                    other_goal = self.other_robot_wrapper.current_global_goal
+                    dists_to_other = np.linalg.norm(frontiers - other_goal, axis=1)
+                    
+                    # 過濾掉離另一機器人目標太近的點
+                    valid_mask = dists_to_other >= self.min_target_separation
+                    if np.any(valid_mask):
+                        valid_indices = np.where(valid_mask)[0]
+                        new_target = frontiers[valid_indices[np.argmin(dists[valid_indices])]]
+                        print(f"[NCM DEBUG] {robot_name}: 後援選點時避開另一機器人")
+                    else:
+                        new_target = frontiers[np.argmin(dists)]
+                else:
+                    new_target = frontiers[np.argmin(dists)]
             else:
-                print(f"[NCM DEBUG] {robot_name}: NCM 分配新目標")
-                new_target = np.array(assignments[robot_idx])
+                assigned_target = np.array(adjusted_assignments[robot_idx])
+                dist_to_target = np.linalg.norm(assigned_target - self.robot.robot_position)
+                print(f"[NCM DEBUG] {robot_name}: NCM 分配新目標 (距離: {dist_to_target:.1f})")
+                new_target = assigned_target
             
             # [關鍵] 更新長期目標
             self.current_global_goal = new_target

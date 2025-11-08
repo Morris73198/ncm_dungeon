@@ -84,7 +84,13 @@ class NeuralGraphMatcher:
         return affinity.cpu().numpy()
     
     def solve_assignment(self, affinity_matrix):
-        """求解最優分配"""
+        """求解最優分配
+        
+        [關鍵修正] 移除了 > 0 的過濾條件
+        神經網路輸出的 affinity 可能都是負數或接近0，
+        但這不代表不應該分配。linear_sum_assignment 
+        已經幫我們找到最優解，應該直接使用。
+        """
         if affinity_matrix.shape[1] == 0:
             return {}
         
@@ -92,9 +98,10 @@ class NeuralGraphMatcher:
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         
         assignments = {}
+        # [修正] 無論 affinity 值為何，都應該分配
+        # Hungarian 算法已經找到了最優配對
         for robot_idx, frontier_idx in zip(row_ind, col_ind):
-            if affinity_matrix[robot_idx, frontier_idx] > 0:
-                assignments[robot_idx] = frontier_idx
+            assignments[robot_idx] = frontier_idx
         
         return assignments
 
@@ -113,7 +120,7 @@ class NeuralCoMappingPlanner:
             
             # 默認路徑支持.global
             if model_path is None:
-                model_path = "a.global"
+                model_path = "ex.global"
             
             model = load_pretrained_ncm(model_path)  # 使用正確的函數名
             self.matcher = NeuralGraphMatcher(model)
