@@ -1,6 +1,6 @@
 """
-加載NeuralCoMapping預訓練模型
-需要從原始repo獲取模型權重
+完整的NeuralCoMapping模型載入器
+包含特徵提取和模型定義
 """
 
 import torch
@@ -82,51 +82,74 @@ class mGNN(nn.Module):
         return affinity
 
 
-def load_pretrained_ncm(model_path):
-    """
-    加載預訓練的NCM模型
-    支持.pth和.global格式
+def count_unknown_neighbors(x, y, op_map, radius=10):
+    """計算周圍未探索區域數量"""
+    h, w = op_map.shape
+    count = 0
+    total = 0
     
-    Args:
-        model_path: 預訓練模型路徑
-        
-    Returns:
-        model: 加載好的模型
-    """
-    model = mGNN()
+    for dx in range(-radius, radius+1):
+        for dy in range(-radius, radius+1):
+            nx, ny = int(x) + dx, int(y) + dy
+            if 0 <= nx < w and 0 <= ny < h:
+                total += 1
+                if op_map[ny, nx] == 127:  # 未探索區域
+                    count += 1
     
-    try:
-        # 嘗試直接加載
-        if model_path.endswith('.global'):
-            # .global文件是PyTorch全局權重
-            checkpoint = torch.load(model_path, map_location='cpu')
-            
-            # .global可能只是state_dict,也可能包含其他信息
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'])
-            else:
-                # 直接是state_dict
-                model.load_state_dict(checkpoint)
-        else:
-            # .pth文件
-            checkpoint = torch.load(model_path, map_location='cpu')
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-        
-        model.eval()
-        print(f"✅ 成功加載預訓練模型: {model_path}")
-    except FileNotFoundError:
-        print(f"⚠️  找不到預訓練模型: {model_path}")
-        print("   使用隨機初始化的模型 (性能會較差)")
-    except Exception as e:
-        print(f"⚠️  加載模型時出錯: {e}")
-        print("   使用隨機初始化的模型")
+    return count / max(total, 1)
+
+
+def estimate_exploration_gain(x, y, op_map, radius=15):
+    """估計探索收益"""
+    h, w = op_map.shape
+    gain = 0
     
-    return model
+    for dx in range(-radius, radius+1):
+        for dy in range(-radius, radius+1):
+            nx, ny = int(x) + dx, int(y) + dy
+            if 0 <= nx < w and 0 <= ny < h:
+                if op_map[ny, nx] == 127:
+                    dist = np.sqrt(dx**2 + dy**2)
+                    gain += 1.0 / (1.0 + dist)
+    
+    return gain
+
+
+def check_line_of_sight(x1, y1, x2, y2, op_map):
+    """檢查兩點間是否有直線視線(簡化版)"""
+    # 使用Bresenham算法
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+    x, y = x1, y1
+    x_inc = 1 if x2 > x1 else -1
+    y_inc = 1 if y2 > y1 else -1
+    
+    h, w = op_map.shape
+    
+    if dx > dy:
+        error = dx / 2
+        while x != x2:
+            if 0 <= int(x) < w and 0 <= int(y) < h:
+                if op_map[int(y), int(x)] == 0:  # 障礙物
+                    return 0.0
+            x += x_inc
+            error -= dy
+            if error < 0:
+                y += y_inc
+                error += dx
+    else:
+        error = dy / 2
+        while y != y2:
+            if 0 <= int(x) < w and 0 <= int(y) < h:
+                if op_map[int(y), int(x)] == 0:
+                    return 0.0
+            y += y_inc
+            error -= dx
+            if error < 0:
+                x += x_inc
+                error += dy
+    
+    return 1.0
 
 
 def extract_features(robots, frontiers, op_map):
@@ -135,14 +158,23 @@ def extract_features(robots, frontiers, op_map):
     
     Args:
         robots: List of robot positions [(x,y), ...]
-        frontiers: Array of frontier positions (N, 2)
+        frontiers: List of frontier positions [(x,y), ...]
         op_map: Occupancy map
         
     Returns:
-        node_features, edge_features, edge_indices
+        node_features: torch.FloatTensor (num_nodes, 5)
+        edge_features: torch.FloatTensor (num_edges, 3)
+        edge_indices: torch.LongTensor (num_edges, 2)
     """
     num_robots = len(robots)
     num_frontiers = len(frontiers)
+    
+    if num_frontiers == 0:
+        # 處理沒有frontier的情況
+        node_features = torch.zeros((num_robots, 5))
+        edge_features = torch.zeros((0, 3))
+        edge_indices = torch.zeros((0, 2), dtype=torch.long)
+        return node_features, edge_features, edge_indices
     
     # Node features: [x_norm, y_norm, utility, dist_to_nearest_robot, exploration_gain]
     node_features = []
@@ -209,67 +241,65 @@ def extract_features(robots, frontiers, op_map):
     return node_features, edge_features, edge_indices
 
 
-def count_unknown_neighbors(x, y, op_map, radius=10):
-    """計算周圍未知區域數量"""
-    h, w = op_map.shape
-    count = 0
-    for dx in range(-radius, radius+1):
-        for dy in range(-radius, radius+1):
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < w and 0 <= ny < h:
-                if op_map[ny, nx] == 127:  # 未知區域
-                    count += 1
-    return count / (radius * 2 + 1) ** 2
-
-
-def estimate_exploration_gain(x, y, op_map, sensor_range=80):
-    """估計探索收益"""
-    # 簡化版: 計算sensor_range內的未知區域比例
-    h, w = op_map.shape
-    unknown = 0
-    total = 0
+def load_pretrained_ncm(model_path):
+    """
+    加載預訓練的NCM模型
+    支持.pth和.global格式
     
-    for dx in range(-sensor_range, sensor_range+1):
-        for dy in range(-sensor_range, sensor_range+1):
-            if dx*dx + dy*dy <= sensor_range*sensor_range:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h:
-                    total += 1
-                    if op_map[ny, nx] == 127:
-                        unknown += 1
-    
-    return unknown / max(total, 1)
-
-
-def check_line_of_sight(x1, y1, x2, y2, op_map):
-    """檢查兩點間是否有直線可見(沒有障礙物)"""
-    # Bresenham's line algorithm
-    dx = abs(x2 - x1)
-    dy = abs(y2 - y1)
-    sx = 1 if x1 < x2 else -1
-    sy = 1 if y1 < y2 else -1
-    err = dx - dy
-    
-    x, y = x1, y1
-    while True:
-        if op_map[y, x] == 1:  # 障礙物
-            return 0.0
+    Args:
+        model_path: 預訓練模型路徑
         
-        if x == x2 and y == y2:
-            break
-        
-        e2 = 2 * err
-        if e2 > -dy:
-            err -= dy
-            x += sx
-        if e2 < dx:
-            err += dx
-            y += sy
+    Returns:
+        model: 加載好的模型
+    """
+    model = mGNN()
     
-    return 1.0
-
-
-if __name__ == "__main__":
-    # 測試
-    model = load_pretrained_ncm("ncm_pretrained.pth")
-    print(f"Model loaded: {model}")
+    try:
+        print(f"🔍 正在載入checkpoint: {model_path}")
+        checkpoint = torch.load(model_path, map_location='cpu')
+        
+        if isinstance(checkpoint, dict):
+            print(f"   Checkpoint keys: {list(checkpoint.keys())}")
+            
+            # 情況1: 包含'network'鍵的RL訓練checkpoint
+            if 'network' in checkpoint:
+                print("   檢測到RL訓練checkpoint格式")
+                network_state = checkpoint['network']
+                
+                # 嘗試載入,使用strict=False允許部分匹配
+                missing_keys, unexpected_keys = model.load_state_dict(
+                    network_state, strict=False
+                )
+                
+                if missing_keys:
+                    print(f"   ⚠️  Missing keys: {len(missing_keys)} keys")
+                
+                if unexpected_keys:
+                    print(f"   ⚠️  Unexpected keys: {len(unexpected_keys)} keys")
+                
+                # 檢查是否有任何權重被載入
+                loaded_params = sum(p.numel() for p in model.parameters())
+                print(f"   📊 模型參數總數: {loaded_params}")
+                
+            # 情況2: 直接的state_dict
+            elif 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            elif 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                model.load_state_dict(checkpoint, strict=False)
+        else:
+            model.load_state_dict(checkpoint, strict=False)
+        
+        model.eval()
+        print(f"✅ 模型載入完成!")
+        
+    except FileNotFoundError:
+        print(f"⚠️  找不到預訓練模型: {model_path}")
+        print("   使用隨機初始化的模型")
+    except Exception as e:
+        print(f"⚠️  加載模型時出錯: {e}")
+        print("   使用隨機初始化的模型")
+    
+    model.eval()
+    return model

@@ -5,6 +5,7 @@ NeuralCoMapping Adapter
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+import torch
 
 
 class SimplifiedGraphMatcher:
@@ -48,6 +49,9 @@ class SimplifiedGraphMatcher:
     
     def solve_assignment(self, affinity_matrix):
         """求解最優分配"""
+        if affinity_matrix.shape[1] == 0:
+            return {}
+        
         cost_matrix = -affinity_matrix
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         
@@ -68,7 +72,6 @@ class NeuralGraphMatcher:
     def compute_affinity_matrix(self, robots, frontiers, op_map):
         """使用神經網路計算affinity"""
         from ncm_model_loader import extract_features
-        import torch
         
         node_features, edge_features, edge_indices = extract_features(
             robots, frontiers, op_map
@@ -81,6 +84,9 @@ class NeuralGraphMatcher:
     
     def solve_assignment(self, affinity_matrix):
         """求解最優分配"""
+        if affinity_matrix.shape[1] == 0:
+            return {}
+        
         cost_matrix = -affinity_matrix
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         
@@ -108,7 +114,7 @@ class NeuralCoMappingPlanner:
             if model_path is None:
                 model_path = "a.global"
             
-            model = load_pretrained_ncm(model_path)
+            model = load_pretrained_ncm(model_path)  # 使用正確的函數名
             self.matcher = NeuralGraphMatcher(model)
             print("✅ 神經網路模型載入完成!")
         else:
